@@ -1,0 +1,957 @@
+// ============================================================
+// Te Reparo Cloud API — Prisma Schema (PostgreSQL)
+// ============================================================
+// Versión cloud del esquema de Te Reparo Manager.
+// Cada tabla "syncable" replica los campos del esquema local SQLite
+// y añade campos cloud: originWorkshopId, cloudVersion,
+// lastSyncedFromWorkshopAt, lastSyncedToWorkshopAt, deletedAt y
+// la relación cloudWorkshop -> Workshop (SetNull al borrar el taller).
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// ENUMS
+// ============================================================
+
+enum RolUsuario {
+  SUPER_ADMIN
+  ADMIN
+  VENDEDOR
+}
+
+enum EspecialidadOperario {
+  ELECTRONICA
+  INFORMATICA
+}
+
+enum TipoCategoria {
+  PRODUCTO
+  PIEZA
+}
+
+enum TipoCliente {
+  PERSONA_NATURAL
+  EMPRESA
+}
+
+enum EstadoVenta {
+  COMPLETADA
+  ANULADA
+}
+
+enum EstadoServicio {
+  PENDIENTE
+  COMPLETADO
+  ENTREGADO
+  CANCELADO
+}
+
+enum TipoServicio {
+  ELECTRONICA
+  INFORMATICA
+}
+
+enum TipoGarantia {
+  PRODUCTO
+  SERVICIO
+}
+
+enum EstadoGarantia {
+  ACTIVA
+  VENCIDA
+  INVALIDADA
+}
+
+enum ResolucionReclamacion {
+  REPARACION_SIN_COSTO
+  REEMPLAZO
+  RECHAZO
+}
+
+enum TipoMovimiento {
+  INGRESO
+  GASTO
+  COMPRA
+}
+
+enum UrgenciaPedido {
+  BAJA
+  MEDIA
+  ALTA
+}
+
+enum EstadoPedido {
+  PENDIENTE
+  APROBADO
+  RECHAZADO
+  CONVERTIDO
+}
+
+enum TipoDevolucion {
+  PRODUCTO
+  PIEZA
+}
+
+enum EstadoDevolucion {
+  PENDIENTE_REVISION
+  APROBADA
+  RECHAZADA
+}
+
+enum TipoComisionEntry {
+  SALE
+  SERVICE
+}
+
+enum EstadoCommissionEntry {
+  ACTIVE
+  CANCELLED
+}
+
+enum EstadoOperatorPayment {
+  PENDING
+  PAID
+}
+
+// Cloud-specific enums
+
+enum SyncOperation {
+  INSERT
+  UPDATE
+  DELETE
+}
+
+enum ActorType {
+  WORKSHOP
+  SUPER_ADMIN
+  SYSTEM
+}
+
+// ============================================================
+// CLOUD-SPECIFIC MODELS
+// ============================================================
+
+/// Cuenta cloud de un taller. Genera un apiTokenHash para autenticar
+/// las sincronizaciones desde el cliente local. Cada registro "syncable"
+/// guarda su originWorkshopId para saber a qué taller pertenece.
+model Workshop {
+  id            String   @id @default(cuid())
+  name          String
+  address       String?
+  phone         String?
+  apiTokenHash  String   @unique
+  cloudVersion  Int      @default(0)
+  lastSeenAt    DateTime?
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  // Back-relations a TODAS las tablas syncables (WorkshopX pattern)
+  talleres               Taller[]               @relation("WorkshopTaller")
+  usuarios               Usuario[]               @relation("WorkshopUsuario")
+  usuarioTalleres        UsuarioTaller[]         @relation("WorkshopUsuarioTaller")
+  operarios              Operario[]              @relation("WorkshopOperario")
+  clientes               Cliente[]               @relation("WorkshopCliente")
+  categorias             Categoria[]             @relation("WorkshopCategoria")
+  productos              Producto[]              @relation("WorkshopProducto")
+  piezas                 Pieza[]                 @relation("WorkshopPieza")
+  ventas                 Venta[]                 @relation("WorkshopVenta")
+  ventaItems             VentaItem[]             @relation("WorkshopVentaItem")
+  servicios              Servicio[]              @relation("WorkshopServicio")
+  servicioItemPiezas     ServicioItemPieza[]     @relation("WorkshopServicioItemPieza")
+  garantias              Garantia[]              @relation("WorkshopGarantia")
+  reclamacionesGarantia  ReclamacionGarantia[]   @relation("WorkshopReclamacionGarantia")
+  movimientos            Movimiento[]            @relation("WorkshopMovimiento")
+  gastos                 Gasto[]                 @relation("WorkshopGasto")
+  compras                Compra[]                @relation("WorkshopCompra")
+  compraItems            CompraItem[]            @relation("WorkshopCompraItem")
+  pedidosInternos        PedidoInterno[]         @relation("WorkshopPedidoInterno")
+  devoluciones           Devolucion[]            @relation("WorkshopDevolucion")
+  commissionEntries      CommissionEntry[]       @relation("WorkshopCommissionEntry")
+  operatorPayments       OperatorPayment[]        @relation("WorkshopOperatorPayment")
+  configuracion          ConfiguracionGlobal[]   @relation("WorkshopConfiguracionGlobal")
+
+  // SyncEvents producidos por este taller
+  syncEvents SyncEvent[]
+
+  @@map("workshops")
+}
+
+/// Cola de eventos de sincronización: cada cambio en una tabla syncable
+/// produce un SyncEvent que el cliente bajará según su cloudVersion.
+model SyncEvent {
+  id          String        @id @default(cuid())
+  workshopId  String?
+  tableName   String
+  recordId    String
+  operation   SyncOperation
+  payload     Json
+  cloudVersion Int
+  createdAt   DateTime      @default(now())
+  deliveredTo String[]      @default([])
+
+  workshop    Workshop?      @relation(fields: [workshopId], references: [id], onDelete: SetNull)
+
+  @@index([workshopId, cloudVersion])
+  @@index([tableName, recordId])
+  @@map("sync_events")
+}
+
+/// Bitácora de auditoría: registra acciones del taller, del super admin
+/// o del sistema, con antes/después del registro afectado.
+model AuditLog {
+  id            String     @id @default(cuid())
+  actorId       String
+  actorType     ActorType
+  action        String
+  tableName     String
+  recordId      String?
+  workshopId    String?
+  beforeData    Json?
+  afterData     Json?
+  errorMessage  String?
+  createdAt     DateTime   @default(now())
+
+  @@index([actorId, createdAt])
+  @@index([tableName, recordId])
+  @@index([workshopId, createdAt])
+  @@map("audit_logs")
+}
+
+// ============================================================
+// USUARIOS Y TALLERES (syncable)
+// ============================================================
+
+model Usuario {
+  id            String      @id @default(cuid())
+  email         String      @unique
+  password      String
+  nombre        String
+  rol           RolUsuario
+  activo        Boolean      @default(true)
+  telefono      String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  talleres      UsuarioTaller[]
+  ventas        Venta[]
+  movimientos   Movimiento[]
+  pedidos       PedidoInterno[]   @relation("Solicitante")
+  aprobaciones  PedidoInterno[]   @relation("Aprobador")
+  garantias     Garantia[]
+  devolucionesRevisadas Devolucion[] @relation("RevisorDevolucion")
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopUsuario", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("usuarios")
+}
+
+model Taller {
+  id            String       @id @default(cuid())
+  nombre        String
+  direccion     String
+  telefono      String
+  encargado     String?
+  activo        Boolean       @default(true)
+  rfc           String?
+  razonSocial   String?
+  ciudad        String?
+  codigoPostal  String?
+  limiteDescuento Float      @default(10)
+  horarioApertura String?
+  horarioCierre   String?
+  metodosPago     String     @default("Efectivo,Tarjeta,Transferencia")
+  garantiaProductoDias Int   @default(30)
+  garantiaServicioDias Int   @default(90)
+  plantillaGarantia  String?
+  formatoTicket      String?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  deletedAt     DateTime?
+
+  usuarios      UsuarioTaller[]
+  productos     Producto[]
+  piezas        Pieza[]
+  categorias    Categoria[]
+  ventas        Venta[]
+  servicios     Servicio[]
+  movimientos   Movimiento[]
+  pedidos       PedidoInterno[]
+  gastos        Gasto[]
+  compras       Compra[]
+  devoluciones  Devolucion[]
+  garantias     Garantia[]
+  commissionEntries CommissionEntry[]
+  operatorPayments  OperatorPayment[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopTaller", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("talleres")
+}
+
+model UsuarioTaller {
+  id        String   @id @default(cuid())
+  usuarioId String
+  tallerId  String
+  usuario   Usuario  @relation(fields: [usuarioId], references: [id], onDelete: Cascade)
+  taller    Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([usuarioId, tallerId])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopUsuarioTaller", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("usuario_taller")
+}
+
+// ============================================================
+// OPERARIOS (sin login)
+// ============================================================
+
+model Operario {
+  id            String              @id @default(cuid())
+  nombre        String
+  telefono      String?
+  especialidad  EspecialidadOperario
+  activo        Boolean              @default(true)
+  createdAt     DateTime            @default(now())
+
+  servicios     Servicio[]
+  ventas        Venta[]
+  comisiones    CommissionEntry[]
+  pagos         OperatorPayment[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopOperario", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("operarios")
+}
+
+// ============================================================
+// CLIENTES
+// ============================================================
+
+model Cliente {
+  id              String   @id @default(cuid())
+  nombre          String
+  telefono        String?
+  email           String?
+  tipo            TipoCliente @default(PERSONA_NATURAL)
+  rfc             String?
+  direccion       String?
+  esClienteGeneral Boolean @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  ventas          Venta[]
+  servicios       Servicio[]
+  garantias       Garantia[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopCliente", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("clientes")
+}
+
+// ============================================================
+// CATEGORÍAS
+// ============================================================
+
+model Categoria {
+  id        String         @id @default(cuid())
+  nombre    String
+  tipo      TipoCategoria
+  activa    Boolean        @default(true)
+  tallerId  String
+  taller    Taller         @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+  deletedAt DateTime?
+
+  productos Producto[]
+  piezas    Pieza[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopCategoria", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("categorias")
+}
+
+// ============================================================
+// INVENTARIO DUAL
+// ============================================================
+
+model Producto {
+  id              String   @id @default(cuid())
+  sku             String
+  codigoBarras    String   @unique
+  nombre          String
+  descripcion     String?
+  precioCosto     Float
+  precioVenta     Float
+  stock           Int      @default(0)
+  stockMinimo     Int      @default(5)
+  garantiaDias    Int      @default(30)
+  categoriaId     String?
+  tallerId        String
+  activo          Boolean  @default(true)
+  operatorCommissionType  String?
+  operatorCommissionValue Float?
+  tags            String   @default("[]")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  categoria       Categoria? @relation(fields: [categoriaId], references: [id])
+  taller          Taller     @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  ventaItems      VentaItem[]
+  compraItems     CompraItem[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopProducto", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("productos")
+}
+
+model Pieza {
+  id              String   @id @default(cuid())
+  sku             String
+  codigoBarras    String   @unique
+  nombre          String
+  descripcion     String?
+  costoUnitario   Float
+  precioVenta     Float
+  stock           Int      @default(0)
+  stockMinimo     Int      @default(5)
+  garantiaFabricaDias Int?
+  categoriaId     String?
+  tallerId        String
+  activo          Boolean  @default(true)
+  operatorPaymentType  String?
+  operatorPaymentValue Float?
+  tags            String   @default("[]")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  deletedAt       DateTime?
+
+  categoria       Categoria? @relation(fields: [categoriaId], references: [id])
+  taller          Taller     @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  servicioItems   ServicioItemPieza[]
+  compraItems     CompraItem[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopPieza", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("piezas")
+}
+
+// ============================================================
+// VENTAS (POS)
+// ============================================================
+
+model Venta {
+  id            String   @id @default(cuid())
+  folio         String   @unique
+  tallerId      String
+  clienteId     String
+  vendedorId    String
+  operarioId    String?
+  subtotal      Float
+  total         Float
+  metodoPago    String   @default("Efectivo")
+  estado        EstadoVenta @default(COMPLETADA)
+  notas         String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  taller        Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  cliente       Cliente  @relation(fields: [clienteId], references: [id])
+  vendedor      Usuario  @relation(fields: [vendedorId], references: [id])
+  operario      Operario? @relation(fields: [operarioId], references: [id])
+  items         VentaItem[]
+  garantia      Garantia?
+  movimientos   Movimiento[]
+  devoluciones  Devolucion[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopVenta", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("ventas")
+}
+
+model VentaItem {
+  id          String   @id @default(cuid())
+  ventaId     String
+  productoId  String
+  cantidad    Int
+  precioUnitario Float
+  subtotal    Float
+  venta       Venta    @relation(fields: [ventaId], references: [id], onDelete: Cascade)
+  producto    Producto @relation(fields: [productoId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopVentaItem", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("venta_items")
+}
+
+// ============================================================
+// SERVICIOS
+// ============================================================
+
+model Servicio {
+  id              String   @id @default(cuid())
+  folio           String   @unique
+  tallerId        String
+  clienteId       String
+  operarioId      String
+  tipo            TipoServicio
+  marca           String
+  modelo          String
+  imei            String?
+  problemaReportado String
+  diagnostico     String?
+  descripcionServicio String
+  estado          EstadoServicio @default(COMPLETADO)
+  precioManoObra  Float
+  subtotalPiezas  Float
+  total           Float
+  metodoPago      String   @default("Efectivo")
+  pagado          Boolean  @default(false)
+  notas           String?
+  fechaEntrega    DateTime?
+  garantiaDias    Int      @default(90)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  taller          Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  cliente         Cliente  @relation(fields: [clienteId], references: [id])
+  operario        Operario @relation(fields: [operarioId], references: [id])
+  piezasUtilizadas ServicioItemPieza[]
+  garantia        Garantia?
+  movimientos     Movimiento[]
+  devoluciones    Devolucion[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopServicio", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("servicios")
+}
+
+model ServicioItemPieza {
+  id            String   @id @default(cuid())
+  servicioId    String
+  piezaId       String
+  cantidad      Int
+  costoUnitario Float
+  precioVenta   Float
+  subtotal      Float
+  servicio      Servicio @relation(fields: [servicioId], references: [id], onDelete: Cascade)
+  pieza         Pieza    @relation(fields: [piezaId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopServicioItemPieza", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("servicio_item_piezas")
+}
+
+// ============================================================
+// GARANTÍAS
+// ============================================================
+
+model Garantia {
+  id              String   @id @default(cuid())
+  folio           String   @unique
+  tallerId        String
+  clienteId       String
+  ventaId         String?  @unique
+  servicioId      String?  @unique
+  tipo            TipoGarantia
+  fechaInicio     DateTime
+  duracionDias    Int
+  fechaVencimiento DateTime
+  descripcionCobertura String?
+  estado          EstadoGarantia @default(ACTIVA)
+  emitidaPorId    String
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  taller          Taller   @relation(fields: [tallerId], references: [id])
+  cliente         Cliente  @relation(fields: [clienteId], references: [id])
+  venta           Venta?   @relation(fields: [ventaId], references: [id])
+  servicio        Servicio? @relation(fields: [servicioId], references: [id])
+  usuario         Usuario   @relation(fields: [emitidaPorId], references: [id])
+  reclamaciones   ReclamacionGarantia[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopGarantia", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("garantias")
+}
+
+model ReclamacionGarantia {
+  id          String   @id @default(cuid())
+  garantiaId  String
+  fecha       DateTime @default(now())
+  descripcion String
+  resolucion  ResolucionReclamacion
+  motivoResolucion String?
+  atendidaPorId String
+  createdAt   DateTime @default(now())
+
+  garantia    Garantia @relation(fields: [garantiaId], references: [id], onDelete: Cascade)
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopReclamacionGarantia", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("reclamaciones_garantia")
+}
+
+// ============================================================
+// DEVOLUCIONES
+// ============================================================
+
+model Devolucion {
+  id              String   @id @default(cuid())
+  folio           String   @unique
+  tallerId        String
+  tipo            TipoDevolucion
+  ventaId         String?
+  servicioId      String?
+  productoId      String?
+  piezaId         String?
+  cantidad        Int
+  motivo          String
+  estado          EstadoDevolucion @default(PENDIENTE_REVISION)
+  revisadaPorId   String?
+  fechaRevision   DateTime?
+  notasRevision   String?
+  createdAt       DateTime @default(now())
+
+  taller          Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  venta           Venta?   @relation(fields: [ventaId], references: [id])
+  servicio        Servicio? @relation(fields: [servicioId], references: [id])
+  revisadaPor     Usuario? @relation("RevisorDevolucion", fields: [revisadaPorId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopDevolucion", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("devoluciones")
+}
+
+// ============================================================
+// MOVIMIENTOS / CAJA
+// ============================================================
+
+model Movimiento {
+  id          String   @id @default(cuid())
+  tallerId    String
+  tipo        TipoMovimiento
+  concepto    String
+  monto       Float
+  categoria   String?
+  usuarioId   String
+  ventaId     String?
+  servicioId  String?
+  compraId    String?  @unique
+  fecha       DateTime @default(now())
+  notas       String?
+
+  taller      Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  usuario     Usuario  @relation(fields: [usuarioId], references: [id])
+  venta       Venta?   @relation(fields: [ventaId], references: [id])
+  servicio    Servicio? @relation(fields: [servicioId], references: [id])
+  compra      Compra?  @relation(fields: [compraId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopMovimiento", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("movimientos")
+}
+
+model Gasto {
+  id          String   @id @default(cuid())
+  tallerId    String
+  concepto    String
+  monto       Float
+  categoria   String
+  fecha       DateTime @default(now())
+  notas       String?
+
+  taller      Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopGasto", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("gastos")
+}
+
+// ============================================================
+// COMPRAS
+// ============================================================
+
+model Compra {
+  id          String   @id @default(cuid())
+  folio       String   @unique
+  tallerId    String
+  proveedor   String?
+  total       Float
+  fecha       DateTime @default(now())
+  notas       String?
+
+  taller      Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  items       CompraItem[]
+  movimientos Movimiento[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopCompra", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("compras")
+}
+
+model CompraItem {
+  id          String   @id @default(cuid())
+  compraId    String
+  productoId  String?
+  piezaId     String?
+  cantidad    Int
+  costoUnitario Float
+  subtotal    Float
+  compra      Compra   @relation(fields: [compraId], references: [id], onDelete: Cascade)
+  producto    Producto? @relation(fields: [productoId], references: [id])
+  pieza       Pieza?   @relation(fields: [piezaId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopCompraItem", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("compra_items")
+}
+
+// ============================================================
+// PEDIDOS INTERNOS
+// ============================================================
+
+model PedidoInterno {
+  id          String   @id @default(cuid())
+  folio       String   @unique
+  tallerId    String
+  solicitanteId String
+  descripcion String
+  cantidad    Int
+  urgencia    UrgenciaPedido @default(MEDIA)
+  estado      EstadoPedido @default(PENDIENTE)
+  aprobadoPorId String?
+  fechaAprobacion DateTime?
+  notas       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  taller      Taller   @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  solicitante Usuario  @relation("Solicitante", fields: [solicitanteId], references: [id])
+  aprobadoPor Usuario? @relation("Aprobador", fields: [aprobadoPorId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopPedidoInterno", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("pedidos_internos")
+}
+
+// ============================================================
+// COMISIONES Y PAGOS A OPERARIOS
+// ============================================================
+
+model CommissionEntry {
+  id             String   @id @default(cuid())
+  operarioId     String
+  tallerId       String
+  ventaId        String?
+  servicioId     String?
+  ventaItemProductoId String?
+  servicioItemPiezaId String?
+  amount         Float
+  type           TipoComisionEntry
+  description    String
+  estado         EstadoCommissionEntry @default(ACTIVE)
+  operatorPaymentId String?
+  createdAt      DateTime @default(now())
+
+  operario       Operario  @relation(fields: [operarioId], references: [id])
+  taller         Taller    @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  operatorPayment OperatorPayment? @relation(fields: [operatorPaymentId], references: [id])
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopCommissionEntry", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("commission_entries")
+}
+
+model OperatorPayment {
+  id          String   @id @default(cuid())
+  folio       String   @unique
+  operarioId  String
+  tallerId    String
+  amount      Float
+  date        DateTime
+  paidAt      DateTime?
+  paidById    String?
+  status      EstadoOperatorPayment @default(PENDING)
+  notas       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  operario       Operario  @relation(fields: [operarioId], references: [id])
+  taller         Taller    @relation(fields: [tallerId], references: [id], onDelete: Cascade)
+  commissionEntries CommissionEntry[]
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopOperatorPayment", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("operator_payments")
+}
+
+// ============================================================
+// CONFIGURACIÓN GLOBAL
+// ============================================================
+
+model ConfiguracionGlobal {
+  id              String   @id @default(cuid())
+  moneda          String   @default("USD")
+  formatoTicket   String?
+  datosFiscalesEmpresa String?
+  pais            String   @default("Cuba")
+  tipoCambio      Float    @default(650)
+  serverUrl       String?
+  ultimoSync      DateTime?
+  syncEnabled     Boolean  @default(false)
+  syncInterval    Int      @default(5)
+  adminPaymentType String?
+  adminPaymentValue Float?
+  updatedAt       DateTime @updatedAt
+
+  // —— Sync fields (cloud) ——
+  originWorkshopId        String?
+  cloudVersion            Int        @default(0)
+  lastSyncedFromWorkshopAt DateTime?
+  lastSyncedToWorkshopAt   DateTime?
+  deletedAt               DateTime?
+  cloudWorkshop           Workshop?  @relation("WorkshopConfiguracionGlobal", fields: [originWorkshopId], references: [id], onDelete: SetNull)
+
+  @@map("configuracion_global")
+}
